@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+venv/
+env/
+
+.env
+.env.*
+
+bot.log
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+*.sqlite3
+
+tmp/
+config.cpython-*.py
+врачи с расписанием.json
+

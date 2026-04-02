@@ -1,0 +1,19 @@
+[Unit]
+Description=Zapisvrachi Telegram bot (record to doctors)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/Zapisvrachi
+EnvironmentFile=/root/Zapisvrachi/.env
+ExecStart=/root/Zapisvrachi/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/root/Zapisvrachi/bot.log
+StandardError=append:/root/Zapisvrachi/bot.log
+
+[Install]
+WantedBy=multi-user.target
