@@ -194,9 +194,17 @@ class MisClient:
                 continue
         return CreateAppointmentResponse(success=False, error=str(last_error) if last_error else "Create appointment failed")
 
-    async def cancel_appointment(self, mis_uid: str) -> CancelAppointmentResponse:
-        url = f"{self.base_url}/hs/bwi/CancelBookAnAppointment"
-        body = {**self._base_body(), "UID": mis_uid}
+    async def cancel_appointment(
+        self, mis_uid: str, reason: str = "Пациент отказался"
+    ) -> CancelAppointmentResponse:
+        url = f"{self.base_url}/hs/bwi/AppointmentCancel"
+        body: dict[str, Any] = {
+            **self._base_body(),
+            "Method": "CancelBookAnAppointment",
+            "GUID": mis_uid,
+            "Reason": reason,
+            "AdditionalInformation": "",
+        }
         try:
             raw = await self._post_json(url, body)
             ans = raw.get("Ответ") or raw.get("Ответы") or {}
@@ -205,6 +213,7 @@ class MisClient:
                 ok = raw.get("Результат")
             return CancelAppointmentResponse(success=bool(ok), raw=raw)
         except Exception as e:
+            logger.warning("cancel_appointment failed: %s", e)
             return CancelAppointmentResponse(success=False, error=str(e))
 
     async def get_employee_contacts(self) -> dict[str, dict[str, str]]:

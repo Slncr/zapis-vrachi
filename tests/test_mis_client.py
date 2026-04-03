@@ -56,3 +56,11 @@ async def test_cancel_appointment_parses_result(mock_config):
         client = MisClient()
         resp = await client.cancel_appointment("some-guid")
         assert resp.success is True
+        call_args = mock_post.call_args
+        url = str(call_args[0][0] if call_args[0] else "")
+        assert "AppointmentCancel" in url
+        body = call_args.kwargs.get("json") or {}
+        assert body.get("GUID") == "some-guid"
+        assert body.get("Method") == "CancelBookAnAppointment"
+        assert body.get("Reason") == "Пациент отказался"
+        assert body.get("AdditionalInformation") == ""

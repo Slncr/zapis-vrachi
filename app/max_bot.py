@@ -29,6 +29,16 @@ from app.parsers import parse_patient_line
 
 logger = logging.getLogger(__name__)
 
+_WELCOME_AUTH_TEXT = (
+    "Здравствуйте!\n\n"
+    "Для авторизации напишите своё ФИО одним сообщением — так же, как в МИС "
+    "(фамилия и имя, при необходимости отчество)."
+)
+
+_NEED_AUTH_TEXT = (
+    "Сначала авторизуйтесь: отправьте /start и в следующем сообщении введите своё ФИО, как в МИС."
+)
+
 
 @dataclass
 class MaxRuntime:
@@ -93,14 +103,6 @@ def _extract_callback_payload(update: dict[str, Any]) -> tuple[str | None, str |
     payload = cb.get("payload") or cb.get("data") or update.get("payload")
     callback_id = cb.get("callback_id") or cb.get("id")
     return (str(payload) if payload else None, str(callback_id) if callback_id else None)
-
-
-async def _send_start(runtime: MaxRuntime, chat_id: str) -> None:
-    await runtime.client.send_message(
-        user_id=chat_id,
-        text="Здравствуйте. Нажмите «Регистрация» и введите ФИО врача.",
-        buttons=[[{"text": "Регистрация", "callback": "reg"}]],
-    )
 
 
 async def _send_to_target(
@@ -413,12 +415,7 @@ async def _handle_message_created(runtime: MaxRuntime, update: dict[str, Any]) -
     low = text.lower()
     if low in {"/start", "start", "начать"}:
         await runtime.session_repo.set(user_id, STATE_START, {})
-        await _send_to_target(
-            runtime,
-            target,
-            "Здравствуйте. Нажмите «Регистрация» и введите ФИО врача.",
-            buttons=[[{"text": "Регистрация", "callback": "reg"}]],
-        )
+        await _send_to_target(runtime, target, _WELCOME_AUTH_TEXT)
         return
     if state == STATE_START:
         # Accept FIO directly in start state (callback buttons may not work on all MAX clients).
@@ -435,8 +432,7 @@ async def _handle_message_created(runtime: MaxRuntime, update: dict[str, Any]) -
         await _send_to_target(
             runtime,
             target,
-            "Введите ФИО врача (как в МИС) или нажмите «Регистрация».",
-            buttons=[[{"text": "Регистрация", "callback": "reg"}]],
+            "Врач не найден. Введите ФИО ещё раз — как в МИС (фамилия и имя, при необходимости отчество).",
         )
         return
     if state == STATE_REG:
@@ -458,7 +454,7 @@ async def _handle_message_created(runtime: MaxRuntime, update: dict[str, Any]) -
             await _send_to_target(runtime, target, "Телефон не совпал. Повторите ввод.")
             return
         await runtime.session_repo.set(user_id, STATE_SCHEDULE_READY, data)
-        await _send_to_target(runtime, target, text=f"Регистрация успешна: {data.get('doctor_fio','')}")
+        await _send_to_target(runtime, target, text=f"Авторизация успешна: {data.get('doctor_fio','')}")
         clinics = (doc or {}).get("clinic_uids") or []
         if isinstance(clinics, str):
             clinics = [clinics]
@@ -522,24 +518,20 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
         s = await runtime.session_repo.get(user_id)
         doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
         if not doctor_uid:
-            await _send_to_target(
-                runtime,
-                target,
-                "Сначала зарегистрируйтесь (введите ФИО врача).",
-                buttons=[[{"text": "Регистрация", "callback": "reg"}]],
-            )
+            await _send_to_target(runtime, target, _NEED_AUTH_TEXT)
             return
         await _send_appointments_list(runtime, target, doctor_uid)
         return
     if payload == "reg":
-        await runtime.session_repo.set(user_id, STATE_REG, {})
-        await _send_to_target(runtime, target, "Введите ФИО врача:")
+        # Старые callback «reg» из прошлых версий бота.
+        await runtime.session_repo.set(user_id, STATE_START, {})
+        await _send_to_target(runtime, target, _WELCOME_AUTH_TEXT)
         return
     if payload == "schedule":
         s = await runtime.session_repo.get(user_id)
         doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
         if not doctor_uid:
-            await _send_to_target(runtime, target, "Сначала зарегистрируйтесь.")
+            await _send_to_target(runtime, target, _NEED_AUTH_TEXT)
             return
         doc = await runtime.doctor_repo.get_by_uid(doctor_uid)
         clinics = (doc or {}).get("clinic_uids") or []
@@ -552,12 +544,7 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
         s = await runtime.session_repo.get(user_id)
         doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
         if not doctor_uid:
-            await _send_to_target(
-                runtime,
-                target,
-                "Здравствуйте. Нажмите «Регистрация» и введите ФИО врача.",
-                buttons=[[{"text": "Регистрация", "callback": "reg"}]],
-            )
+            await _send_to_target(runtime, target, _NEED_AUTH_TEXT)
             return
         doc = await runtime.doctor_repo.get_by_uid(doctor_uid)
         clinics = (doc or {}).get("clinic_uids") or []
@@ -574,12 +561,7 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
         s = await runtime.session_repo.get(user_id)
         doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
         if not doctor_uid:
-            await _send_to_target(
-                runtime,
-                target,
-                "Здравствуйте. Нажмите «Регистрация» и введите ФИО врача.",
-                buttons=[[{"text": "Регистрация", "callback": "reg"}]],
-            )
+            await _send_to_target(runtime, target, _NEED_AUTH_TEXT)
             return
         clinic_uid = payload.replace("sched_clinic_", "", 1).strip()
         names = await _get_clinic_name_map(runtime)
@@ -594,12 +576,7 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
             s = await runtime.session_repo.get(user_id)
             doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
             if not doctor_uid:
-                await _send_to_target(
-                    runtime,
-                    target,
-                    "Здравствуйте. Нажмите «Регистрация» и введите ФИО врача.",
-                    buttons=[[{"text": "Регистрация", "callback": "reg"}]],
-                )
+                await _send_to_target(runtime, target, _NEED_AUTH_TEXT)
                 return
             day_ymd = payload.replace("cal_day_", "", 1)
             await _send_day_schedule(runtime, target, doctor_uid, day_ymd)
@@ -607,12 +584,7 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
         s = await runtime.session_repo.get(user_id)
         doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
         if not doctor_uid:
-            await _send_to_target(
-                runtime,
-                target,
-                "Здравствуйте. Нажмите «Регистрация» и введите ФИО врача.",
-                buttons=[[{"text": "Регистрация", "callback": "reg"}]],
-            )
+            await _send_to_target(runtime, target, _NEED_AUTH_TEXT)
             return
         ym = payload.split("_")[-1]
         await _send_schedule(runtime, target, doctor_uid, target_ym=ym)
@@ -621,7 +593,7 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
         s = await runtime.session_repo.get(user_id)
         doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
         if not doctor_uid:
-            await _send_to_target(runtime, target, "Сначала зарегистрируйтесь.")
+            await _send_to_target(runtime, target, _NEED_AUTH_TEXT)
             return
         await _send_schedule(runtime, target, doctor_uid)
         return
@@ -770,8 +742,9 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
         if not resp.success:
             await _send_to_target(runtime, target, f"Ошибка записи в МИС: {resp.error or 'неизвестная ошибка'}")
             return
+        local_id: int | None = None
         try:
-            await runtime.appointment_repo.create(
+            local_id = await runtime.appointment_repo.create(
                 mis_uid=resp.uid,
                 chat_id=user_id,
                 doctor_uid=doctor_uid,
@@ -787,7 +760,7 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
                 service_name=service_name,
             )
         except Exception:
-            pass
+            local_id = None
         snap = dict(data)
         for k in [
             "book_day_ymd",
@@ -821,7 +794,12 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
             clinic_name2,
             title="Запись создана в МИС.",
         ) + (f"\n\nУИД в МИС: {resp.uid}" if resp.uid else "")
-        await _send_to_target(runtime, target, summary, buttons=_main_menu_rows())
+        post_buttons = _main_menu_rows()
+        if local_id is not None:
+            post_buttons = [
+                [{"text": "Отменить эту запись", "callback": f"cancel_app_{local_id}"}]
+            ] + post_buttons
+        await _send_to_target(runtime, target, summary, buttons=post_buttons)
         return
     if payload == "menu":
         await _send_to_target(runtime, target, "Выберите филиал:", buttons=_main_menu_rows())

@@ -411,7 +411,7 @@ class AppointmentRepository:
         clinic_uid: str | None = None,
         service_uid: str | None = None,
         service_name: str | None = None,
-    ) -> None:
+    ) -> int | None:
         try:
             visit_date_obj = datetime.strptime(visit_date, "%Y-%m-%d").date()
         except Exception:
@@ -431,13 +431,14 @@ class AppointmentRepository:
             except Exception:
                 birthday_obj = None
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 INSERT INTO appointments(
                     mis_uid, chat_id, doctor_uid, patient_surname, patient_name, patient_father_name,
                     birthday, phone, visit_date, visit_time, clinic_uid, service_uid, service_name
                 )
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                RETURNING id
                 """,
                 mis_uid,
                 str(chat_id),
@@ -453,6 +454,7 @@ class AppointmentRepository:
                 service_uid,
                 service_name,
             )
+        return int(row["id"]) if row else None
 
     async def get_by_id(self, appointment_id: int) -> dict[str, Any] | None:
         async with self.pool.acquire() as conn:
