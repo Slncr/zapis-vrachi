@@ -17,15 +17,15 @@ from app.bot_shared import (
     STATE_SCHEDULE_READY,
     STATE_BOOK_SERVICE,
     STATE_BOOK_PATIENT,
+    STATE_BOOK_CONFIRM,
     STATE_START,
     build_month_day_grid,
     month_label_ru,
     month_start_end,
-    parse_schedule_dates,
     shift_month,
 )
 from app.max_client import MaxClient
-from app.parsers import get_grafik_from_schedule_response, parse_patient_line
+from app.parsers import parse_patient_line
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +38,13 @@ class MaxRuntime:
     doctor_repo: Any
     clinic_repo: Any
     appointment_repo: Any
+    schedule_repo: Any
 
 
 def _main_menu_rows() -> list[list[dict[str, str]]]:
     return [
         [{"text": "Выбрать филиал", "callback": "my_schedule"}],
+        [{"text": "Мои записи", "callback": "my_appointments"}],
     ]
 
 
@@ -115,6 +117,57 @@ async def _send_to_target(
     )
 
 
+async def _send_appointments_list(
+    runtime: MaxRuntime,
+    target: dict[str, str],
+    doctor_uid: str,
+    *,
+    limit: int = 50,
+) -> None:
+    rows = await runtime.appointment_repo.list_active_for_doctor(doctor_uid, limit=limit)
+    if not rows:
+        await _send_to_target(
+            runtime,
+            target,
+            "Активных предстоящих записей пока нет.",
+            buttons=_main_menu_rows(),
+        )
+        return
+    clinic_names = await _get_clinic_name_map(runtime)
+    lines: list[str] = ["Ваши записи:"]
+    buttons: list[list[dict[str, str]]] = []
+    for ap in rows:
+        aid = ap.get("id")
+        dt = ap.get("visit_date")
+        tm = str(ap.get("visit_time") or "")[:5]
+        try:
+            d_human = dt.strftime("%d.%m.%Y") if dt else ""
+        except Exception:
+            d_human = str(dt)
+        fio = " ".join(
+            x
+            for x in [
+                str(ap.get("patient_surname") or "").strip(),
+                str(ap.get("patient_name") or "").strip(),
+                str(ap.get("patient_father_name") or "").strip(),
+            ]
+            if x
+        )
+        clinic_uid = str(ap.get("clinic_uid") or "").strip()
+        clinic_name = clinic_names.get(clinic_uid, clinic_uid or "Филиал")
+        service_name = str(ap.get("service_name") or "").strip() or "—"
+        lines.append(f"{d_human} {tm} — {fio or 'пациент'}")
+        lines.append(f"  Филиал: {clinic_name}")
+        lines.append(f"  Услуга: {service_name}")
+        lines.append("")
+        if aid:
+            buttons.append(
+                [{"text": f"Отменить {d_human} {tm}", "callback": f"cancel_app_{aid}"}]
+            )
+    buttons.append([{"text": "Назад в меню", "callback": "menu"}])
+    await _send_to_target(runtime, target, "\n".join(lines), buttons=buttons)
+
+
 async def _send_schedule(
     runtime: MaxRuntime,
     target: dict[str, str],
@@ -142,21 +195,21 @@ async def _send_schedule(
     if target_ym and len(target_ym) == 6 and target_ym.isdigit():
         year = int(target_ym[:4])
         month = int(target_ym[4:6])
-    start_d, finish_d = month_start_end(year, month)
-    start = start_d.strftime("%d.%m.%Y 00:00:00")
-    finish = finish_d.strftime("%d.%m.%Y 23:59:59")
     try:
-        resp = await runtime.client_mis.get_schedule20(doctor_uid, start, finish)
-        grafik = get_grafik_from_schedule_response(resp.get("raw") or {})
+        days = await runtime.schedule_repo.dates_with_slots_in_month(
+            doctor_uid, selected_clinic_uid, year, month
+        )
     except Exception as e:
-        await _send_to_target(runtime, target, f"Ошибка получения расписания: {e}")
+        await _send_to_target(runtime, target, f"Ошибка чтения расписания из БД: {e}")
         return
-    if selected_clinic_uid:
-        grafik = [g for g in grafik if _extract_clinic_uid(g) == selected_clinic_uid]
-        if not grafik:
-            await _send_to_target(runtime, target, "По выбранному филиалу расписание не найдено.")
-            return
-    days = parse_schedule_dates(grafik)
+    if not days:
+        await _send_to_target(
+            runtime,
+            target,
+            "По выбранному филиалу нет данных расписания. Дождитесь синхронизации или обратитесь к администратору.",
+            buttons=[[{"text": "Назад", "callback": "menu"}]],
+        )
+        return
     data = await runtime.session_repo.get(target.get("user_id") or target.get("chat_id") or "")
     session_data = dict(data.get("data") or {})
     clinic_name = str(session_data.get("selected_clinic_name") or session_data.get("clinic_name") or "").strip()
@@ -196,54 +249,6 @@ async def _send_schedule(
     )
 
 
-def _slot_minutes_from_schedule_block(schedule: dict) -> int:
-    raw = str(schedule.get("ДлительностьПриема") or "")
-    m = re.search(r"T00:(\d{2}):", raw)
-    if m:
-        try:
-            v = int(m.group(1))
-            if v > 0:
-                return v
-        except Exception:
-            pass
-    return 20
-
-
-def _extract_times_for_day(grafik: list[dict], day_iso: str) -> tuple[list[str], list[dict]]:
-    free_times: set[str] = set()
-    busy_entries: list[dict] = []
-    for sch in grafik:
-        periods = sch.get("ПериодыГрафика") or {}
-        step = _slot_minutes_from_schedule_block(sch)
-        for x in periods.get("СвободноеВремя") or []:
-            d = str(x.get("Дата") or "").split("T")[0]
-            if d != day_iso:
-                continue
-            b = str(x.get("ВремяНачала") or "").split("T")[-1][:5]
-            e = str(x.get("ВремяОкончания") or "").split("T")[-1][:5]
-            if not b or not e:
-                continue
-            try:
-                bh, bm = map(int, b.split(":"))
-                eh, em = map(int, e.split(":"))
-                cur = bh * 60 + bm
-                end = eh * 60 + em
-                while cur < end:
-                    free_times.add(f"{cur // 60:02d}:{cur % 60:02d}")
-                    cur += step
-            except Exception:
-                continue
-        for x in periods.get("ЗанятоеВремя") or []:
-            d = str(x.get("Дата") or "").split("T")[0]
-            if d != day_iso:
-                continue
-            b = str(x.get("ВремяНачала") or "").split("T")[-1][:5]
-            e = str(x.get("ВремяОкончания") or "").split("T")[-1][:5]
-            if b:
-                busy_entries.append({"time": b, "end": e})
-    return sorted(free_times), sorted(busy_entries, key=lambda z: z["time"])
-
-
 def _time_to_minutes(hhmm: str) -> int:
     try:
         hh, mm = hhmm.split(":")[:2]
@@ -267,7 +272,7 @@ def _pick_ticket_for_busy(busy_start: str, busy_end: str, tickets: list[dict[str
     return ("", "")
 
 
-def _booking_confirmation_text(data: dict, doctor_fio: str, clinic_name: str) -> str:
+def _booking_confirmation_text(data: dict, doctor_fio: str, clinic_name: str, *, title: str | None = None) -> str:
     fio = " ".join(
         x
         for x in [
@@ -283,8 +288,9 @@ def _booking_confirmation_text(data: dict, doctor_fio: str, clinic_name: str) ->
     day_ymd = str(data.get("book_day_ymd") or "")
     time_hhmm = str(data.get("book_time_hhmm") or "")
     date_human = f"{day_ymd[6:8]}.{day_ymd[4:6]}.{day_ymd[:4]}" if len(day_ymd) == 8 else day_ymd
+    head = title if title is not None else "Проверьте данные записи:"
     return (
-        "Проверьте данные записи:\n\n"
+        f"{head}\n\n"
         f"ФИО: {fio}\n"
         f"Телефон: {phone}\n"
         f"Дата рождения: {birthday}\n"
@@ -306,51 +312,15 @@ async def _send_day_schedule(runtime: MaxRuntime, target: dict[str, str], doctor
         await _send_to_target(runtime, target, "Сначала выберите филиал.")
         return
     day_iso = f"{day_ymd[:4]}-{day_ymd[4:6]}-{day_ymd[6:8]}"
-    start = f"{day_ymd[6:8]}.{day_ymd[4:6]}.{day_ymd[:4]} 00:00:00"
-    finish = f"{day_ymd[6:8]}.{day_ymd[4:6]}.{day_ymd[:4]} 23:59:59"
     try:
-        resp = await runtime.client_mis.get_schedule20(doctor_uid, start, finish)
-        grafik = get_grafik_from_schedule_response(resp.get("raw") or {})
+        slot_d = datetime.strptime(day_iso, "%Y-%m-%d").date()
+        free_times = await runtime.schedule_repo.list_free_times(doctor_uid, selected_clinic_uid, slot_d)
+        busy_raw = await runtime.schedule_repo.list_busy_blocks(doctor_uid, selected_clinic_uid, slot_d)
     except Exception as e:
-        await _send_to_target(runtime, target, f"Ошибка получения расписания дня: {e}")
+        await _send_to_target(runtime, target, f"Ошибка чтения расписания дня: {e}")
         return
-    grafik = [g for g in grafik if _extract_clinic_uid(g) == selected_clinic_uid]
-    free_times, busy_entries = _extract_times_for_day(grafik, day_iso)
-
-    tickets_rows: list[dict[str, str]] = []
-    try:
-        day_dt = datetime.strptime(day_iso, "%Y-%m-%d")
-        # MIS PatientTickets may return empty on tight one-day range; use wider window and filter locally.
-        w_start = (day_dt.replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d 00:00:00")
-        w_finish = (day_dt.replace(day=28) + timedelta(days=10)).replace(day=1) + timedelta(days=40)
-        w_finish = w_finish.replace(day=1) - timedelta(seconds=1)
-        window_finish = w_finish.strftime("%Y-%m-%d %H:%M:%S")
-        tickets = await runtime.client_mis.get_patient_tickets_http(w_start, window_finish, employee_uid=doctor_uid)
-        if not tickets:
-            tickets = await runtime.client_mis.get_patient_tickets_http(w_start, window_finish, employee_uid=None)
-        for t in tickets:
-            filial = str(t.get("Филиал") or "").strip().lower()
-            if filial != selected_clinic_uid.lower():
-                continue
-            emp = str(t.get("Сотрудник") or "").strip().lower()
-            if emp and emp != doctor_uid.lower():
-                continue
-            dt_start = str(t.get("ДатаНачала") or "")
-            if not dt_start.startswith(day_iso):
-                continue
-            ts = str(t.get("ДатаНачала") or "").split("T")[-1][:5]
-            fio = str(t.get("КлиентНаименование") or "").strip()
-            works = t.get("СписокРабот") or []
-            if isinstance(works, dict):
-                works = [works]
-            service = ""
-            if works and isinstance(works, list):
-                w0 = works[0] if isinstance(works[0], dict) else {}
-                service = str(w0.get("Наименование") or "").strip()
-            if ts:
-                tickets_rows.append({"time": ts, "fio": fio, "service": service})
-    except Exception:
-        pass
+    busy_entries = [{"time": b["time"], "end": b.get("end") or ""} for b in busy_raw]
+    tickets_rows = [{"time": b["time"], "fio": b.get("fio") or "", "service": b.get("service") or ""} for b in busy_raw]
 
     pretty = f"{day_ymd[6:8]}.{day_ymd[4:6]}.{day_ymd[:4]}"
     lines = [f"Записи на {pretty}:"]
@@ -383,27 +353,22 @@ async def _send_day_schedule(runtime: MaxRuntime, target: dict[str, str], doctor
 async def _get_services_for_doctor(runtime: MaxRuntime, doctor_uid: str) -> list[dict]:
     if not doctor_uid:
         return []
-    services = await runtime.doctor_repo.get_main_services(doctor_uid)
+    services = await runtime.doctor_repo.list_services_normalized(doctor_uid)
     if services:
         return services
+    legacy = await runtime.doctor_repo.get_main_services(doctor_uid)
+    if legacy:
+        return legacy
     try:
         now = datetime.now()
-        # Keep window moderate: very wide ranges may cause MIS 500.
         start = (now - timedelta(days=365)).strftime("%Y-%m-%d 00:00:00")
         finish = (now + timedelta(days=365)).strftime("%Y-%m-%d 23:59:59")
         services = await runtime.client_mis.get_doctor_services_from_tickets_http(doctor_uid, start, finish)
         if services:
-            await runtime.doctor_repo.set_main_services(doctor_uid, services)
+            await runtime.doctor_repo.replace_normalized_services(doctor_uid, services)
         return services
     except Exception:
         return []
-
-
-def _extract_clinic_uid(schedule: dict) -> str:
-    val = schedule.get("Клиника")
-    if isinstance(val, dict):
-        return str(val.get("УИД") or val.get("UID") or "").strip()
-    return str(val or "").strip()
 
 
 async def _get_clinic_name_map(runtime: MaxRuntime) -> dict[str, str]:
@@ -553,6 +518,19 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
             await runtime.client.answer_callback(callback_id=callback_id)
         except Exception:
             logger.exception("MAX answer_callback failed")
+    if payload == "my_appointments":
+        s = await runtime.session_repo.get(user_id)
+        doctor_uid = str((s.get("data") or {}).get("doctor_uid") or "").strip()
+        if not doctor_uid:
+            await _send_to_target(
+                runtime,
+                target,
+                "Сначала зарегистрируйтесь (введите ФИО врача).",
+                buttons=[[{"text": "Регистрация", "callback": "reg"}]],
+            )
+            return
+        await _send_appointments_list(runtime, target, doctor_uid)
+        return
     if payload == "reg":
         await runtime.session_repo.set(user_id, STATE_REG, {})
         await _send_to_target(runtime, target, "Введите ФИО врача:")
@@ -713,6 +691,46 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
             f"{suffix}",
         )
         return
+    if payload and payload.startswith("cancel_app_"):
+        try:
+            app_id = int(payload.replace("cancel_app_", "", 1))
+        except Exception:
+            await _send_to_target(runtime, target, "Не удалось распознать запись.")
+            return
+        ap = await runtime.appointment_repo.get_by_id(app_id)
+        if not ap or ap.get("cancelled_at"):
+            await _send_to_target(runtime, target, "Запись не найдена или уже отменена.")
+            return
+        mis_uid = str(ap.get("mis_uid") or "").strip()
+        ok = True
+        err = ""
+        if mis_uid:
+            resp = await runtime.client_mis.cancel_appointment(mis_uid)
+            if not resp.success:
+                ok = False
+                err = resp.error or "МИС не подтвердила отмену"
+        if ok:
+            await runtime.appointment_repo.mark_cancelled(app_id)
+            d = ap.get("visit_date")
+            t = str(ap.get("visit_time") or "")[:5]
+            try:
+                d_h = d.strftime("%d.%m.%Y") if d else ""
+            except Exception:
+                d_h = str(d)
+            await _send_to_target(
+                runtime,
+                target,
+                f"Запись на {d_h} {t} отменена.",
+                buttons=_main_menu_rows(),
+            )
+        else:
+            await _send_to_target(
+                runtime,
+                target,
+                f"Не удалось отменить в МИС: {err}",
+                buttons=_main_menu_rows(),
+            )
+        return
     if payload == "book_back":
         s = await runtime.session_repo.get(user_id)
         await runtime.session_repo.set(user_id, STATE_BOOK_PATIENT, dict(s.get("data") or {}))
@@ -770,6 +788,7 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
             )
         except Exception:
             pass
+        snap = dict(data)
         for k in [
             "book_day_ymd",
             "book_time_hhmm",
@@ -784,7 +803,25 @@ async def _handle_callback(runtime: MaxRuntime, update: dict[str, Any]) -> None:
         ]:
             data.pop(k, None)
         await runtime.session_repo.set(user_id, STATE_SCHEDULE_READY, data)
-        await _send_to_target(runtime, target, "Запись успешно создана.", buttons=_main_menu_rows())
+        doc2 = await runtime.doctor_repo.get_by_uid(doctor_uid) if doctor_uid else None
+        doctor_fio2 = str((doc2 or {}).get("fio") or "")
+        clinic_name2 = str(snap.get("selected_clinic_name") or clinic_uid)
+        summary = _booking_confirmation_text(
+            {
+                "book_patient_surname": snap.get("book_patient_surname"),
+                "book_patient_name": snap.get("book_patient_name"),
+                "book_patient_father_name": snap.get("book_patient_father_name"),
+                "book_patient_phone": snap.get("book_patient_phone"),
+                "book_patient_birthday_human": snap.get("book_patient_birthday_human"),
+                "book_service_name": snap.get("book_service_name"),
+                "book_day_ymd": day_ymd,
+                "book_time_hhmm": time_hhmm,
+            },
+            doctor_fio2,
+            clinic_name2,
+            title="Запись создана в МИС.",
+        ) + (f"\n\nУИД в МИС: {resp.uid}" if resp.uid else "")
+        await _send_to_target(runtime, target, summary, buttons=_main_menu_rows())
         return
     if payload == "menu":
         await _send_to_target(runtime, target, "Выберите филиал:", buttons=_main_menu_rows())

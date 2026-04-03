@@ -43,3 +43,36 @@ CREATE INDEX IF NOT EXISTS idx_appointments_doctor_date_time
 
 CREATE INDEX IF NOT EXISTS idx_appointments_chat_id
     ON appointments (chat_id);
+
+-- Normalized services (filled by sync from MIS tickets / future sources).
+CREATE TABLE IF NOT EXISTS doctor_services (
+    employee_uid TEXT NOT NULL REFERENCES doctors (employee_uid) ON DELETE CASCADE,
+    service_uid TEXT NOT NULL,
+    service_name TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (employee_uid, service_uid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doctor_services_employee ON doctor_services (employee_uid);
+
+-- Cached schedule from MIS: free bookable slots and busy blocks (for display).
+CREATE TABLE IF NOT EXISTS schedule_slots (
+    employee_uid TEXT NOT NULL REFERENCES doctors (employee_uid) ON DELETE CASCADE,
+    clinic_uid TEXT NOT NULL,
+    slot_date DATE NOT NULL,
+    time_hhmm TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('free', 'busy')),
+    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (employee_uid, clinic_uid, slot_date, time_hhmm, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_slots_lookup
+    ON schedule_slots (employee_uid, clinic_uid, slot_date);
+
+-- Sync bookkeeping (optional diagnostics).
+CREATE TABLE IF NOT EXISTS sync_state (
+    resource TEXT PRIMARY KEY,
+    last_success_at TIMESTAMPTZ,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb
+);

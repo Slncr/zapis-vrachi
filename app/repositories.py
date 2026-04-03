@@ -197,6 +197,177 @@ class DoctorRepository:
             rows = await conn.fetch("SELECT employee_uid FROM doctors ORDER BY employee_uid")
         return [str(r["employee_uid"]) for r in rows]
 
+    async def list_services_normalized(self, employee_uid: str) -> list[dict[str, str]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT service_uid, service_name
+                FROM doctor_services
+                WHERE employee_uid=$1
+                ORDER BY service_name
+                """,
+                employee_uid,
+            )
+        return [{"uid": str(r["service_uid"]), "name": str(r["service_name"])} for r in rows]
+
+    async def replace_normalized_services(self, employee_uid: str, services: list[dict[str, str]]) -> None:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM doctor_services WHERE employee_uid=$1", employee_uid)
+                for s in services or []:
+                    uid = str(s.get("uid") or "").strip()
+                    name = str(s.get("name") or "").strip()
+                    if not uid or not name:
+                        continue
+                    await conn.execute(
+                        """
+                        INSERT INTO doctor_services(employee_uid, service_uid, service_name)
+                        VALUES ($1, $2, $3)
+                        """,
+                        employee_uid,
+                        uid,
+                        name,
+                    )
+                await conn.execute(
+                    "UPDATE doctors SET main_services=$2::jsonb WHERE employee_uid=$1",
+                    employee_uid,
+                    json.dumps(services or [], ensure_ascii=False),
+                )
+
+
+class ScheduleRepository:
+    def __init__(self, pool: asyncpg.Pool):
+        self.pool = pool
+
+    async def replace_month(
+        self,
+        *,
+        employee_uid: str,
+        clinic_uid: str,
+        year: int,
+        month: int,
+        rows: list[tuple[date, str, str, dict[str, Any]]],
+    ) -> None:
+        """Delete all slots in calendar month, then insert (slot_date, time_hhmm, kind, meta)."""
+        from calendar import monthrange
+
+        last = monthrange(year, month)[1]
+        d0 = date(year, month, 1)
+        d1 = date(year, month, last)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    DELETE FROM schedule_slots
+                    WHERE employee_uid=$1 AND clinic_uid=$2
+                      AND slot_date >= $3 AND slot_date <= $4
+                    """,
+                    employee_uid,
+                    clinic_uid,
+                    d0,
+                    d1,
+                )
+                for slot_d, hhmm, kind, meta in rows:
+                    if kind not in {"free", "busy"}:
+                        continue
+                    await conn.execute(
+                        """
+                        INSERT INTO schedule_slots(
+                            employee_uid, clinic_uid, slot_date, time_hhmm, kind, meta, synced_at
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
+                        ON CONFLICT (employee_uid, clinic_uid, slot_date, time_hhmm, kind)
+                        DO UPDATE SET meta=EXCLUDED.meta, synced_at=NOW()
+                        """,
+                        employee_uid,
+                        clinic_uid,
+                        slot_d,
+                        hhmm,
+                        kind,
+                        json.dumps(meta or {}, ensure_ascii=False),
+                    )
+
+    async def dates_with_slots_in_month(
+        self,
+        employee_uid: str,
+        clinic_uid: str,
+        year: int,
+        month: int,
+    ) -> set[date]:
+        from calendar import monthrange
+
+        last = monthrange(year, month)[1]
+        d0 = date(year, month, 1)
+        d1 = date(year, month, last)
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT slot_date
+                FROM schedule_slots
+                WHERE employee_uid=$1 AND clinic_uid=$2
+                  AND slot_date >= $3 AND slot_date <= $4
+                """,
+                employee_uid,
+                clinic_uid,
+                d0,
+                d1,
+            )
+        return {r["slot_date"] for r in rows}
+
+    async def list_free_times(self, employee_uid: str, clinic_uid: str, slot_date: date) -> list[str]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT time_hhmm
+                FROM schedule_slots
+                WHERE employee_uid=$1 AND clinic_uid=$2 AND slot_date=$3 AND kind='free'
+                ORDER BY time_hhmm
+                """,
+                employee_uid,
+                clinic_uid,
+                slot_date,
+            )
+        return [str(r["time_hhmm"]) for r in rows]
+
+    async def list_busy_blocks(
+        self,
+        employee_uid: str,
+        clinic_uid: str,
+        slot_date: date,
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT time_hhmm, meta
+                FROM schedule_slots
+                WHERE employee_uid=$1 AND clinic_uid=$2 AND slot_date=$3 AND kind='busy'
+                ORDER BY time_hhmm
+                """,
+                employee_uid,
+                clinic_uid,
+                slot_date,
+            )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            m: Any = r["meta"]
+            if isinstance(m, str):
+                try:
+                    m = json.loads(m)
+                except Exception:
+                    m = {}
+            elif not isinstance(m, dict):
+                m = {}
+            mm = dict(m)
+            out.append(
+                {
+                    "time": str(r["time_hhmm"]),
+                    "end": str(mm.pop("end", "") or ""),
+                    "fio": str(mm.get("fio") or ""),
+                    "service": str(mm.get("service") or ""),
+                }
+            )
+        return out
+
 
 class ClinicRepository:
     def __init__(self, pool: asyncpg.Pool):
@@ -282,6 +453,56 @@ class AppointmentRepository:
                 service_uid,
                 service_name,
             )
+
+    async def get_by_id(self, appointment_id: int) -> dict[str, Any] | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM appointments
+                WHERE id=$1
+                """,
+                int(appointment_id),
+            )
+        return dict(row) if row else None
+
+    async def mark_cancelled(self, appointment_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE appointments
+                SET cancelled_at = NOW()
+                WHERE id=$1 AND cancelled_at IS NULL
+                """,
+                int(appointment_id),
+            )
+
+    async def list_active_for_doctor(
+        self,
+        doctor_uid: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, mis_uid, visit_date, visit_time,
+                       patient_surname, patient_name, patient_father_name,
+                       phone, clinic_uid, service_name
+                FROM appointments
+                WHERE doctor_uid=$1
+                  AND cancelled_at IS NULL
+                  AND (
+                    visit_date > CURRENT_DATE
+                    OR (visit_date = CURRENT_DATE AND visit_time >= CURRENT_TIME)
+                  )
+                ORDER BY visit_date, visit_time
+                LIMIT $2
+                """,
+                doctor_uid,
+                int(limit),
+            )
+        return [dict(r) for r in rows]
 
     async def get_active_by_doctor_and_time(
         self,

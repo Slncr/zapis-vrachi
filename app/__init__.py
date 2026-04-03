@@ -1,1 +1,1 @@
-# Zapisvrachi Telegram bot + 1C MIS
+# Zapis-vrachi: FastAPI + MAX + PostgreSQL + 1C MIS

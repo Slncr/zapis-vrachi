@@ -1,0 +1,53 @@
+# Полный стек: PostgreSQL + API (FastAPI, sync МИС→БД, long polling MAX).
+# Запуск: docker compose up -d --build
+# Перед запуском: cp .env.example .env и заполните MIS_* и MAX_BOT_TOKEN.
+# DATABASE_URL в контейнере api переопределён на хост postgres (сеть compose).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: zapis
+      POSTGRES_PASSWORD: zapis
+      POSTGRES_DB: zapis
+    volumes:
+      - zapis_pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zapis -d zapis"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - zapis_internal
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zapis-vrachi-api:local
+    restart: unless-stopped
+    # Доступ к HTTP на машине-хосте из контейнера (МИС на localhost хоста → в .env: http://host.docker.internal/...)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      # Внутри сети compose хост БД — имя сервиса «postgres», не localhost.
+      DATABASE_URL: postgresql://zapis:zapis@postgres:5432/zapis
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${API_PUBLISH_PORT:-8000}:8000"
+    networks:
+      - zapis_internal
+
+networks:
+  zapis_internal:
+    driver: bridge
+
+volumes:
+  zapis_pgdata:

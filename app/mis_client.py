@@ -4,12 +4,15 @@ HTTP client for 1C MIS.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import time
 from typing import Any
 
 import httpx
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -92,14 +95,17 @@ class MisClient:
     async def get_enlargement_schedule(self, start_dt: str, finish_dt: str) -> dict[str, Any]:
         # Try both known endpoint names — first bwi/Schedule, fallback GetEnlargementSchedule
         body = {**self._base_body(), "StartDate": start_dt, "FinishDate": finish_dt}
+        errors: list[str] = []
         for path in ("hs/bwi/Schedule", "hs/bwi/GetEnlargementSchedule"):
             url = f"{self.base_url}/{path}"
             try:
                 raw = await self._post_json(url, body)
                 return {"raw": raw}
-            except Exception:
-                continue
-        raise RuntimeError(f"GetEnlargementSchedule: all endpoints failed")
+            except Exception as e:
+                errors.append(f"{path}: {type(e).__name__}: {e}")
+                logger.warning("MIS get_enlargement_schedule %s failed: %s", url, e)
+        detail = "; ".join(errors) if errors else "no attempts"
+        raise RuntimeError(f"GetEnlargementSchedule: all endpoints failed ({detail})")
 
     async def get_schedule20(self, employee_uid: str, start_dt: str, finish_dt: str) -> dict[str, Any]:
         cache_key = (str(employee_uid or "").strip(), start_dt, finish_dt)
@@ -107,6 +113,7 @@ class MisClient:
         if cached is not None:
             return {"raw": cached}
         body = {**self._base_body(), "Employee": employee_uid, "StartDate": start_dt, "FinishDate": finish_dt}
+        errors: list[str] = []
         for path in ("hs/bwi/Schedule", "hs/bwi/GetShedule20"):
             url = f"{self.base_url}/{path}"
             try:
@@ -131,9 +138,11 @@ class MisClient:
                             ans["ГрафикДляСайта"] = filtered
                 self._cache_set(self._schedule_cache, cache_key, raw)
                 return {"raw": raw}
-            except Exception:
-                continue
-        raise RuntimeError(f"GetShedule20: all endpoints failed")
+            except Exception as e:
+                errors.append(f"{path}: {type(e).__name__}: {e}")
+                logger.warning("MIS get_schedule20 %s failed: %s", url, e)
+        detail = "; ".join(errors) if errors else "no attempts"
+        raise RuntimeError(f"GetShedule20: all endpoints failed ({detail})")
 
     async def create_appointment(
         self,

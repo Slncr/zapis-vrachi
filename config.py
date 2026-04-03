@@ -39,8 +39,20 @@ def _optional_int(name: str, default: int) -> int:
         return default
 
 
-TELEGRAM_BOT_TOKEN: str = _required("TELEGRAM_BOT_TOKEN")
-DATABASE_URL: str = _required("DATABASE_URL")
+def _optional_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
+    except Exception:
+        return default
+
+
+DATABASE_URL: str = _optional(
+    "DATABASE_URL",
+    "postgresql://zapis:zapis@127.0.0.1:5432/zapis",
+)
 
 MIS_BASE_URL: str = _required("MIS_BASE_URL")
 MIS_API_KEY: str = _optional("MIS_API_KEY")
@@ -59,11 +71,20 @@ MIS_PATIENT_TICKETS_URL: str = _optional(
 )
 MIS_MAIN_ONLY: bool = _optional_bool("MIS_MAIN_ONLY", True)
 
-ENABLE_MAX_BOT: bool = _optional_bool("ENABLE_MAX_BOT", False)
-MAX_BOT_TOKEN: str = _optional("MAX_BOT_TOKEN")
+ENABLE_MAX_BOT: bool = _optional_bool("ENABLE_MAX_BOT", True)
+MAX_BOT_TOKEN: str = _optional("MAX_BOT_TOKEN", "")
 MAX_API_BASE_URL: str = _optional("MAX_API_BASE_URL", "https://platform-api.max.ru")
 MAX_POLL_TIMEOUT_SEC: int = _optional_int("MAX_POLL_TIMEOUT_SEC", 30)
 MAX_POLL_LIMIT: int = _optional_int("MAX_POLL_LIMIT", 100)
 
 SESSION_TTL_HOURS: int = _optional_int("SESSION_TTL_HOURS", 24)
 DOCTORS_REFRESH_INTERVAL_MINUTES: int = _optional_int("DOCTORS_REFRESH_INTERVAL_MINUTES", 60)
+SCHEDULE_SYNC_INTERVAL_MINUTES: int = _optional_int("SCHEDULE_SYNC_INTERVAL_MINUTES", 30)
+SERVICES_SYNC_INTERVAL_MINUTES: int = _optional_int("SERVICES_SYNC_INTERVAL_MINUTES", 120)
+# Сколько календарных месяцев вперёд тянуть слоты (меньше — меньше запросов к МИС).
+SCHEDULE_SYNC_MONTHS_AHEAD: int = _optional_int("SCHEDULE_SYNC_MONTHS_AHEAD", 2)
+# Пауза между запросами к МИС при sync расписания (сек), снижает 500 на стороне 1С. 0 — без паузы.
+MIS_REQUEST_PAUSE_SEC: float = _optional_float("MIS_REQUEST_PAUSE_SEC", 0.08)
+
+APP_HOST: str = _optional("APP_HOST", "0.0.0.0")
+APP_PORT: int = _optional_int("APP_PORT", 8000)

@@ -11,7 +11,6 @@ from app.mis_client import MisClient
 @pytest.fixture
 def mock_config():
     with patch.dict("os.environ", {
-        "TELEGRAM_BOT_TOKEN": "test-bot-token",
         "DATABASE_URL": "postgresql://localhost/test",
         "MIS_BASE_URL": "http://test.local/mis",
         "MIS_API_KEY": "test-key",
